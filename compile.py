@@ -7,49 +7,11 @@ stdout is reserved for PTX only, so anything for humans goes to stderr.
 """
 
 import sys
-import json
-from dataclasses import dataclass
-from pathlib import Path
 from pprint import pprint
-from emmy.compiler.graph import Graph
+from kernel_spec import load_spec
+from prologue import PrologueMixin
 
-@dataclass
-class KernelSpec:
-    # launch info + GPU kernel IR
-    name: str          # kernel name
-    body: tuple        # given emmy IR
-    params: list       # arg_order, one .u64 param each
-    grid: tuple
-    block: tuple
-    smem_bytes: int
-
-def load_kernel(path):
-    with open(path) as f:
-        graph = Graph.from_dict(json.load(f))
-    # we compile KernelOp only because it is what compiles to PTX
-    for node in graph.nodes.values():
-        if type(node.op).__name__ == "KernelOp":
-            return node.op
-    sys.exit(f"{path}: no KernelOp found")
-
-def load_spec(ir_path):
-    #Load the KernelOp (GPU kernel IR)
-    gpu_kernel_ir = load_kernel(ir_path)
-    # load the Meta (Kernel Launch Code)
-    meta = json.loads((Path(ir_path).parent / "meta.json").read_text())
-
-    for meta_kernel_spec in meta["kernels"]:
-        if meta_kernel_spec["entry"] == gpu_kernel_ir.name:
-            return KernelSpec(gpu_kernel_ir.name,
-                              gpu_kernel_ir.body,
-                              meta_kernel_spec["arg_order"],
-                              tuple(meta_kernel_spec["grid"]),
-                              tuple(meta_kernel_spec["block"]),
-                              meta_kernel_spec["smem_bytes"]
-                             )
-    sys.exit(f"{ir_path}: no kernel '{gpu_kernel_ir.name}' in meta.json")
-
-class Emitter:
+class Emitter(PrologueMixin):
     """Collects PTX lines and hands out fresh virtual registers.
 
     Registers are never reused: ptxas does the real register allocation, so we
@@ -70,6 +32,8 @@ class Emitter:
         self.reg_count = {k: 0 for k in self.REG_TYPES}     # create [r:0, p:0, f:0, rd:0]
         self.buffers = {}                                # buffer name -> pointer register
         self.vars = {}                                   # IR variable name -> register
+        self.shapes = dict(spec.shapes)                  # buffer name -> shape (Smem adds its own later)
+        self.label_count = 0                             # makes every branch label unique
 
     # _________________generic helpers_____________________
 
@@ -84,81 +48,33 @@ class Emitter:
         self.reg_count[reg_name] += 1
         return f"%{reg_name}{n}"
 
-    # _________________Prologue___________________________
-
-    def header(self):
-        return [".version 8.0", ".target sm_89", ".address_size 64", ""]
-
-    def signature(self):
-        signature_ptx = [f".visible .entry {self.spec.name}("]
-        for i, name in enumerate(self.spec.params):
-            if i < (len(self.spec.params) - 1):
-                signature_ptx.append(f"        .param .u64 param_{name},")
-            else:
-                signature_ptx.append(f"        .param .u64 param_{name}")
-        signature_ptx.append(")")
-        return signature_ptx
-
-    def init_gpu_regs(self):
-        lines = []
-        for reg_name, ptx_type in self.REG_TYPES.items():
-            num_reg = max(1, self.reg_count[reg_name])
-            lines.append(f"        .reg {ptx_type}       %{reg_name}<{num_reg}>;")
-        return lines
-
-    def load_input_output_pointers(self):
-        for name in self.spec.params:
-            rd_reg_ptr = self.new_reg("rd")
-            global_reg_ptr = self.new_reg("rd")
-            self.add_line(f"ld.param.u64 {rd_reg_ptr}, [param_{name}];")
-            self.add_line(f"cvta.to.global.u64 {global_reg_ptr}, {rd_reg_ptr}; \n")
-            self.buffers[name] = global_reg_ptr
-
-    def init_thread_ids(self):
-        self.tid = self.new_reg("r")
-        blockIdx_reg = self.new_reg("r")
-        blockDimx_reg = self.new_reg("r")
-        self.gid = self.new_reg("r")
-
-        self.add_line(f"mov.u32 {self.tid}, %tid.x;")
-        self.add_line(f"mov.u32 {blockIdx_reg}, %ctaid.x;")
-        self.add_line(f"mov.u32 {blockDimx_reg}, %ntid.x;")
-        #multiply-add: d = a * b + c.
-        self.add_line(f"mad.lo.u32 {self.gid}, {blockDimx_reg}, {blockIdx_reg}, {self.tid}; \n")
-
-
-    #Threads with gid >= N (N = product of the Tile extents) skip to DONE
-    def bounds_guard(self, tile):
-        n_cells = 1
-        for axis in tile.axes:
-            n_cells *= axis.extent.value
-        skip_thread = self.new_reg("p")
-        self.add_line(f"setp.ge.u32 {skip_thread}, {self.gid}, {n_cells};")
-        self.add_line(f"@{skip_thread} bra DONE; \n")
-
-    # def decode_axes(self, tile):
-    #     """Split gid into the Tile's axis variables, innermost axis first.
-
-    #     Row-major: for axes (a0, a1) with a1 extent E, a1 = gid % E and a0 = gid / E.
-    #     The outermost axis needs no modulo; the innermost needs no division
-    #     before its own modulo. Results go into self.vars for index expressions.
-    #     """
-    #     rest = self.gid
-    #     for i, axis in reversed(list(enumerate(tile.axes))):
-    #         if i == 0:
-    #             self.vars[axis.name] = rest        # outermost: what is left is the index
-    #             break
-    #         extent = axis.extent.value
-    #         axis_reg = self.new_reg("r")
-    #         self.add_line(f"rem.u32 {axis_reg}, {rest}, {extent};")
-    #         self.vars[axis.name] = axis_reg
-    #         quotient = self.new_reg("r")
-    #         self.add_line(f"div.u32 {quotient}, {rest}, {extent};")
-    #         rest = quotient
-    #     self.add_line("")
+    def new_label_id(self):
+        n = self.label_count
+        self.label_count += 1
+        return n
 
     # _________________WALK THE EMMY IR_________________
 
+    # integer BinaryExpr op -> PTX instruction. Index values are never
+    # negative, so unsigned div/rem matches the IR's floor division.
+    INT_ARITH = {
+        "+"  : "add.u32",
+        "-"  : "sub.u32",
+        "*"  : "mul.lo.u32",
+        "/"  : "div.u32",
+        "//" : "div.u32",
+        "%"  : "rem.u32",
+    }
+
+    # comparison BinaryExpr op -> setp condition code
+    COMPARE = {
+        "==" : "eq",
+        "!=" : "ne",
+        "<"  : "lt",
+        "<=" : "le",
+        ">"  : "gt",
+        ">=" : "ge",
+    }
 
     def emit_expr(self, expr):
         # 1, Compile the ast expression tree
@@ -186,17 +102,49 @@ class Emitter:
         elif kind == "BinaryExpr":
             left = self.emit_expr(expr.left)
             right = self.emit_expr(expr.right)
-            reg = self.new_reg("r")
-            if expr.op == "+":
-                self.add_line(f"add.u32 {reg}, {left}, {right};")
-            elif expr.op == "*":
-                self.add_line(f"mul.lo.u32 {reg}, {left}, {right};")
-            else:
+
+            # comparisons produce a predicate (%p) instead of an integer
+            if expr.op in self.COMPARE:
+                pred = self.new_reg("p")
+                self.add_line(f"setp.{self.COMPARE[expr.op]}.s32 {pred}, {left}, {right};")
+                return pred
+
+            ptx_op = self.INT_ARITH.get(expr.op)
+            if ptx_op is None:
                 sys.exit(f"unsupported BinaryExpr op '{expr.op}'")
+            reg = self.new_reg("r")
+            self.add_line(f"{ptx_op} {reg}, {left}, {right};")
             return reg
 
         else:
             sys.exit(f"emit_expr: unsupported expression {kind}")
+
+    def flat_index(self, buffer, index):
+        # 1. turn a multi-dim index tuple into one row-major element index
+        # 2. return the reg that holds it
+        # x[a0, a1] with shape (64, 512) -> a0*512 + a1, done innermost-last:
+        # flat = ((i0 * d1) + i1) * d2 + i2 ...
+
+        if len(index) == 0:
+            # sum_1[] : a scalar output, always element 0
+            reg = self.new_reg("r")
+            self.add_line(f"mov.u32 {reg}, 0;")
+            return reg
+
+        shape = self.shapes[buffer]
+        if len(index) != len(shape): # both need to 1-d, 2-d, 3-d, etc
+            sys.exit(f"flat_index: {buffer} has shape {shape} but index has {len(index)} dims")
+
+        # row major indexing and IR does (rows, column)
+        flat = self.emit_expr(index[0])
+        # zip 
+        for dim, idx_expr in zip(shape[1:], index[1:]):
+            scaled = self.new_reg("r")
+            self.add_line(f"mul.lo.u32 {scaled}, {flat}, {dim};")
+            idx_reg = self.emit_expr(idx_expr) # just a reg = #
+            flat = self.new_reg("r")
+            self.add_line(f"add.u32 {flat}, {scaled}, {idx_reg};")
+        return flat
 
     def get_address(self, buffer, index_reg, nbytes=4):
         #1. calculate the address of uint8_t buffer[index]
@@ -228,7 +176,7 @@ class Emitter:
         if len(stmt.names) != 1:
             sys.exit(f"emit_Load: vector load of {len(stmt.names)} not supported yet")
 
-        idx = self.emit_expr(stmt.index[0])
+        idx = self.flat_index(stmt.input, stmt.index)
         addr = self.get_address(stmt.input, idx, stmt.dtype.nbytes)
         new_reg = self.new_reg("f")
         self.add_line(f"ld.global.f32 {new_reg}, [{addr}];")
@@ -264,7 +212,7 @@ class Emitter:
     def emit_Write(self, stmt):
 
         reg_list_to_write = [self.vars[v] for v in stmt.values]
-        reg_idx = self.emit_expr(stmt.index[0])
+        reg_idx = self.flat_index(stmt.output, stmt.index)
         base_buffer = stmt.output
         addr_reg = self.get_address(base_buffer, reg_idx, stmt.value_dtype.nbytes)
         if stmt.atomic == True:
@@ -279,6 +227,35 @@ class Emitter:
         else:
             sys.exit(f"emit_Write: group of {len(reg_list_to_write)} values not supported")
 
+    def emit_Cond(self, cond_body_stmt):
+        # if (cond) 
+        #   { body } 
+        # else 
+        #   { else_body }
+        #
+        #
+        #     @!p bra ELSE_n;
+        #     {body}
+        #     bra END_n;
+        # ELSE_n:
+        #     { else_body }
+        # END_n:
+
+
+        n = self.new_label_id()
+        pred = self.emit_expr(stmt.cond)  
+        self.add_line(f"@!{pred} bra ELSE_{n};")
+        
+        for s in cond_body_stmt.body:
+            self.emit_stmt(s)
+        self.add_line(f"bra END_{n};")
+
+        self.label(f"ELSE_{n}")
+        for s in cond_body_stmt.else_body:
+            self.emit_stmt(s)
+
+        self.label(f"END_{n}")
+
     def render(self):
         # Build the body first: the .reg counts are only known once every
         # instruction has asked for its registers.
@@ -290,9 +267,7 @@ class Emitter:
         tile = self.spec.body[0]
         # print(tile, file=sys.stderr)
         self.bounds_guard(tile)
-        # One axis only: the axis index is the global thread id.
-        self.vars[tile.axes[0].name] = self.gid
-        # self.decode_axes(tile)
+        self.decode_axes(tile)
 
         # ___Walk____
         print("\n\n", file=sys.stderr)

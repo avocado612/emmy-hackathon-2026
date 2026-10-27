@@ -63,11 +63,94 @@ Tile:
 
 r01_array_sum
 
+======================MORE things to understand=================================
+
+StridedLoop(axis=Axis(name='a1', extent=Dim(512), window=None),
+            start=Var(name='a1_co'),
+            step=Literal(value=128, dtype='int'),
+            body=(
+                    Load(
+                         names=('in0',),
+                         input='x',
+                         index=(Var(name='a0'), Var(name='a1')),
+                         dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)
+                        ),
+                    Accum(
+                         name='acc0',
+                         value='in0',
+                         op=ElementwiseImpl('add'),
+                         dtype=DataType(name='f32', np=dtype('float32'), nbytes=4),
+                         axes=('a1',),
+                         base=None
+                        )
+                ),
+            unroll=False,
+            end=None,
+            seed=True
+           )     
+
+ WarpShuffle(state=('acc0',),
+             state_b=('acc0__o',),
+             combine_states=(Assign(name='acc0',
+                                     op=ElementwiseImpl('add'),
+                                     args=('acc0', 'acc0__o'),
+                                     dtype=None
+                                   ),
+                            ),
+             length=32,
+             dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)
+             ),   
+
+ Smem(name='acc0_smem', extents=(4,), dtype='float', align=0),
+
+
+Cond(cond=BinaryExpr(op='==',
+                    left=Var(name='lane'),
+                    right=Literal(value=0, dtype='int')
+                    ),
+    body=(Write(output='acc0_smem',
+                index=(Var(name='warp'),),
+                values=('acc0',),
+                value_dtype=DataType(name='f32', np=dtype('float32'), nbytes=4),
+                atomic=False,
+                swizzle='NONE'),
+            ),
+    else_body=()
+    ),
+
+Sync(barrier_id=0, count=None, warp=False),
+
+TreeHalve(bufs=('acc0_smem',),
+          state=('acc0',),
+          state_b=('acc0__o',),
+          combine_states=(Assign( name='acc0',
+                                  op=ElementwiseImpl('add'),
+                                  args=('acc0', 'acc0__o'),
+                                  dtype=None
+                                ),
+                         ),
+          length=4,
+          tid_var='warp',
+          dtype=DataType(name='f32', np=dtype('float32'), nbytes=4),
+          barrier_id=0,
+          barrier_count=None,
+          inner=None
+          ),
 
 
 
 
 
+
+
+
+## axes is the same thing as GridDim and BlockDim ##
+_b = GridSize
+_u = BlockSize
+a0 = rows, 
+a1 = columns
+
+compilers don't care about the window?
 
 axes=(
     Axis(name='a0_b', 
