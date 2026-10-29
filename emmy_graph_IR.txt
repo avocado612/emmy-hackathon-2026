@@ -97,11 +97,15 @@ StridedLoop(axis=Axis(name='a1', extent=Dim(512), window=None),
                                      dtype=None
                                    ),
                             ),
-             length=32,
+             length=32,  # of active threads in a warp
              dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)
              ),   
 
- Smem(name='acc0_smem', extents=(4,), dtype='float', align=0),
+Smem(name='acc0_smem', 
+     extents=(4,),
+     dtype='float',
+     align=0
+     ),
 
 
 Cond(cond=BinaryExpr(op='==',
@@ -118,7 +122,10 @@ Cond(cond=BinaryExpr(op='==',
     else_body=()
     ),
 
-Sync(barrier_id=0, count=None, warp=False),
+Sync(barrier_id=0
+    count=None        # how many threads must reach the barrier to continue
+    warp=False        #warp=False: all warps wait in the block, warp=True: only the its warp waits
+    ),
 
 TreeHalve(bufs=('acc0_smem',),
           state=('acc0',),
